@@ -3,5 +3,6 @@ path: ./dataset
 train: images/train
 val: images/val
 
-nc: 1
-names: ["numberDoor"]
+
+nc: 2
+names: ["numberDoor", "lock"]
