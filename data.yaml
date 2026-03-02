@@ -7,4 +7,4 @@ val: images/val
 
 # Définition des objets à reconnaître
 nc: 1
-names: ["porte"]
+names: ["numberDoor"]
