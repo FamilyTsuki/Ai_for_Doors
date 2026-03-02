@@ -1,0 +1,10 @@
+# Chemin absolu ou relatif vers le dossier datasets
+path: ./dataset
+
+# Chemins vers les images
+train: images/train
+val: images/val
+
+# Définition des objets à reconnaître
+nc: 1
+names: ["porte"]
