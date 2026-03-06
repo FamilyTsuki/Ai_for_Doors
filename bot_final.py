@@ -4,141 +4,226 @@ import numpy as np
 import mss
 import os
 import time
+import math
+import random
 import pydirectinput
 from ultralytics import YOLO
+from dataclasses import dataclass, field
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
-# ==========================================
-# CONFIGURATION GÉNÉRALE
-# ==========================================
-PATH_MODEL = "runs/detect/train/weights/best.pt"
-model = YOLO(PATH_MODEL)
-
-# Paramètres de mouvement (Optimisés pour Roblox)
-SENSIVITE_CAMERA = 0.12   
-SMOOTHING = 0.18          
-ZONE_MORTE = 50           
-VITESSE_SCAN = 4
-pydirectinput.PAUSE = 0
-
-# Dimensions de capture (Doit correspondre à ton entraînement)
-LARGEUR, HAUTEUR = 1200, 940
-CENTRE_X = LARGEUR // 2
-
-# ==========================================
-# MOTEUR BAS NIVEAU (SOURIS & CLAVIER)
-# ==========================================
+# ==============================================================================
+# 1. ARCHITECTURE SYSTÈME ET PARAMÈTRES CRITIQUES (LIGNES 20-100)
+# ==============================================================================
 MOUSEEVENTF_MOVE = 0x0001
+WIDTH, HEIGHT = 1200, 940
+CENTER_X, CENTER_Y = WIDTH // 2, HEIGHT // 2
+PATH_MODEL = "runs/detect/train/weights/best.pt"
+DLL_SLAM = os.path.abspath("./slam_lib.dll")
 
-def move_mouse_hardware(dx):
-    """Contourne le Raw Input de Roblox via l'API Win32 brute"""
-    if abs(dx) > 0.5:
-        # Force un minimum de pixels pour réveiller le moteur physique
-        val_x = int(dx) if abs(dx) >= 2 else (2 if dx > 0 else -2)
-        ctypes.windll.user32.mouse_event(MOUSEEVENTF_MOVE, val_x, 0, 0, 0)
+@dataclass
+class PhysicsEngine:
+    """ Gère la dynamique de mouvement de l'agent """
+    velocity: np.array = field(default_factory=lambda: np.array([0.0, 0.0]))
+    acceleration: float = 0.45
+    friction: float = 0.82
+    rotation_speed: float = 0.28
+    look_ahead_factor: float = 1.4
 
-# ==========================================
-# PERCEPTION SLAM
-# ==========================================
-dll_path = os.path.abspath("./slam_lib.dll")
-slam_lib = ctypes.CDLL(dll_path, winmode=0)
-slam_lib.process_frame.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_int)]
-slam_lib.process_frame.restype = ctypes.c_float
+@dataclass
+class CognitiveState:
+    """ Mémoire spatiale et hiérarchie des tâches """
+    objective_stack: list = field(default_factory=list)
+    last_known_door: np.array = field(default_factory=lambda: np.array([CENTER_X, CENTER_Y]))
+    exploration_map: np.array = field(default_factory=lambda: np.zeros((10, 10))) # Mini-grid
+    stuck_buffer: deque = field(default_factory=lambda: deque(maxlen=30))
+    frame_time: float = time.time()
 
-# ==========================================
-# BOUCLE PRINCIPALE D'INTELLIGENCE
-# ==========================================
-nb_points = ctypes.c_int(0)
-historique_mouv = []
-derniere_porte_vue = 0
-direction_exploration = 1
-
-print("🚀 INITIALISATION DE L'IA DOORS...")
-print("⚠️ MODE ADMINISTRATEUR REQUIS")
-time.sleep(3)
-
-with mss.mss() as sct:
-    monitor = {"top": 10, "left": 10, "width": LARGEUR, "height": HAUTEUR}
-
-    while True:
-        # 1. CAPTURE & PERCEPTION
-        img = np.array(sct.grab(monitor))
-        frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        data_ptr = frame.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+# ==============================================================================
+# 2. MOTEUR DE NAVIGATION PAR CHAMPS DE FORCE (LIGNES 101-200)
+# ==============================================================================
+class NavigationPro:
+    @staticmethod
+    def get_repulsion_vector(frame):
+        """ 
+        Analyse le flux optique pour éviter les collisions murales.
         
-        # Calcul du mouvement réel via SLAM
-        mouv = slam_lib.process_frame(LARGEUR, HAUTEUR, data_ptr, ctypes.byref(nb_points))
-        historique_mouv.append(mouv)
-        if len(historique_mouv) > 15: historique_mouv.pop(0)
-        mouv_moyen = sum(historique_mouv) / len(historique_mouv)
-
-        # 2. VISION (YOLO)
-        results = model.predict(frame, conf=0.55, imgsz=320, verbose=False)
-        detections = results[0].boxes
+        """
+        # Analyse des zones de danger (Bords de l'écran)
+        left_slice = frame[HEIGHT//3:, :WIDTH//6]
+        right_slice = frame[HEIGHT//3:, 5*WIDTH//6:]
         
-        cible_x = None
-        if len(detections) > 0:
-            # On cible la porte la plus proche de notre axe central
-            box = sorted(detections, key=lambda b: abs(((b.xyxy[0][0]+b.xyxy[0][2])/2) - CENTRE_X))[0]
-            x1, y1, x2, y2 = box.xyxy[0]
-            cible_x = (x1 + x2) / 2
-            derniere_porte_vue = time.time()
-            
-            # Dessin Debug
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.line(frame, (int(cible_x), 0), (int(cible_x), HAUTEUR), (255, 0, 0), 2)
+        # Calcul de la "densité d'obstacle" par gradient de Sobel
+        l_grad = cv2.Sobel(cv2.cvtColor(left_slice, cv2.COLOR_BGR2GRAY), cv2.CV_64F, 1, 0, ksize=5)
+        r_grad = cv2.Sobel(cv2.cvtColor(right_slice, cv2.COLOR_BGR2GRAY), cv2.CV_64F, 1, 0, ksize=5)
+        
+        l_force = np.mean(np.abs(l_grad))
+        r_force = np.mean(np.abs(r_grad))
+        
+        # Force résultante de répulsion
+        repulsion_x = 0
+        if l_force > 15: repulsion_x += (l_force * 0.8)
+        if r_force > 15: repulsion_x -= (r_force * 0.8)
+        return repulsion_x
 
-        # 3. PRISE DE DÉCISION (LE CERVEAU)
-        status = "EN ATTENTE"
-        color = (255, 255, 255)
+# ==============================================================================
+# 3. CONTRÔLEUR DE MOUVEMENT BALISTIQUE (LIGNES 201-300)
+# ==============================================================================
+class BallisticInput:
+    @staticmethod
+    @staticmethod
+    def move_smooth(dx, dy=0):
+        """ 
+        Mouvement de caméra haute fréquence utilisant une courbe sigmoïde 
+        pour l'accélération et un amortissement quadratique pour la précision.
+        """
+        if abs(dx) < 1.5: return # Ignore les micro-bruits
+        
+        # 1. CALCUL DE LA COURBE SIGMOÏDE
+        # Elle permet de démarrer lentement, d'accélérer brusquement au milieu, 
+        # et de ralentir à l'approche de la cible.
+        # 
 
-        # SCÉNARIO A : ON VOIT UNE PORTE (Navigation active)
-        if cible_x is not None:
-            erreur = cible_x - CENTRE_X
-            # Rotation fluide
-            if abs(erreur) > ZONE_MORTE:
-                move_mouse_hardware((erreur * SENSIVITE_CAMERA) * SMOOTHING)
+
+
+        
+        # Le facteur 100 détermine la 'pente' de l'accélération
+        speed_multiplier = 1 / (1 + math.exp(-abs(dx) / 100))
+        
+        # 2. AMORTISSEMENT DYNAMIQUE (DAMPING)
+        # On réduit la puissance si l'erreur est petite pour éviter l'overshoot
+        # 
+        damping = min(1.0, abs(dx) / 150)
+        
+        # 3. CALCUL DU DELTA FINAL
+        # On combine la sigmoïde, l'amortissement et le gain de rotation (0.5)
+        final_dx = int(dx * speed_multiplier * damping * 0.6)
+        
+        # 4. INJECTION HARDWARE
+        # On limite le mouvement par frame pour ne pas 'casser' le moteur de Roblox
+        if abs(final_dx) > 200: final_dx = 200 if final_dx > 0 else -200
+        
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_MOVE, final_dx, int(dy), 0, 0)
+    @staticmethod
+    def urgent_interact():
+        """ Interaction turbo sans délai """
+        pydirectinput.keyDown('e')
+        time.sleep(0.04) # Timing minimal pour le serveur Roblox
+        pydirectinput.keyUp('e')
+
+# ==============================================================================
+# 4. COUCHE DE PERCEPTION MULTI-THREADÉE (LIGNES 301-450)
+# ==============================================================================
+class GodPerception:
+    def __init__(self):
+        self.model = YOLO(PATH_MODEL)
+        self.slam = ctypes.CDLL(DLL_SLAM, winmode=0)
+        self.slam.process_frame.argtypes = [ctypes.c_int, ctypes.c_int, 
+                                          ctypes.POINTER(ctypes.c_ubyte), 
+                                          ctypes.POINTER(ctypes.c_int)]
+        self.slam.process_frame.restype = ctypes.c_float
+        self.executor = ThreadPoolExecutor(max_workers=2)
+
+    def process(self, frame):
+        # Lancement parallèle : YOLO et SLAM
+        future_yolo = self.executor.submit(self.model.predict, frame, conf=0.5, imgsz=320, verbose=False)
+        
+        nb_pts = ctypes.c_int(0)
+        ptr = frame.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+        motion = self.slam.process_frame(WIDTH, HEIGHT, ptr, ctypes.byref(nb_pts))
+        
+        results = future_yolo.result()
+        return results[0].boxes, motion, nb_pts.value
+
+# ==============================================================================
+# 5. AGENT DÉCISIONNEL SUPRÊME (LIGNES 451-600)
+# ==============================================================================
+class GodAgent:
+    def __init__(self):
+        self.perception = GodPerception()
+        self.physics = PhysicsEngine()
+        self.cog = CognitiveState()
+
+    def run_cycle(self, frame):
+        # 1. Perception
+        boxes, motion, pts = self.perception.process(frame)
+        
+        # 2. Analyse des forces de navigation
+        repulsion_x = NavigationPro.get_repulsion_vector(frame)
+        
+        # 3. Analyse des objectifs (Priorité dynamique)
+        target_x = None
+        best_box = None
+        
+        if len(boxes) > 0:
+            # On cherche l'objectif le plus "rentable" (Taille * Priorité / Distance)
+            priorities = {'key': 5, 'lever': 4, 'door': 2, 'drawer': 1}
+            scored_objs = []
+            for b in boxes:
+                label = self.perception.model.names[int(b.cls[0])]
+                bx = b.xyxy[0]
+                center_obj = (bx[0] + bx[2]) / 2
+                score = (priorities.get(label, 0) * (bx[2]-bx[0])) / (abs(center_obj - CENTER_X) + 1)
+                scored_objs.append((score, center_obj, b))
             
-            # Marche vers l'objectif
+            scored_objs.sort(key=lambda x: x[0], reverse=True)
+            target_x = scored_objs[0][1]
+            best_box = scored_objs[0][2]
+
+        # 4. Exécution du pilotage
+        if target_x:
+            # Calcul de l'erreur + Anticipation
+            error = (target_x - CENTER_X) + repulsion_x
+            BallisticInput.move_smooth(error)
+            
+            # Marche et Strafe
             pydirectinput.keyDown('w')
-            status = "NAVIGATION VERS PORTE"
-            color = (0, 255, 0)
-
-        # SCÉNARIO B : ON EST BLOQUÉ (SLAM)
-        # Si on est censé avancer mais que le décor ne bouge plus
-        elif mouv_moyen < 0.015 and nb_points.value > 15:
-            status = "BLOCAGE DÉTECTÉ - RECALCUL"
-            color = (0, 0, 255)
-            pydirectinput.keyUp('w')
-            pydirectinput.keyDown('s') # Recul
-            time.sleep(0.5)
-            pydirectinput.keyUp('s')
-            move_mouse_hardware(250 * direction_exploration) # Tourne la tête
-            historique_mouv.clear()
-
-        # SCÉNARIO C : TRANSITION (On vient de passer une porte)
-        elif time.time() - derniere_porte_vue < 1.5:
-            status = "ENTRÉE DANS LA SALLE"
-            pydirectinput.keyDown('w') # On continue de marcher pour s'éloigner du mur
-            color = (255, 250, 0)
-
-        # SCÉNARIO D : EXPLORATION (On cherche la suite)
-        else:
-            status = "EXPLORATION / SCAN"
-            pydirectinput.keyUp('w')
-            move_mouse_hardware(VITESSE_SCAN * direction_exploration)
-            # Inversion de scan périodique pour simuler un humain
-            if time.time() % 6 > 5:
-                direction_exploration *= -1
-
-        # 4. AFFICHAGE INTERFACE DEBUG
-        cv2.putText(frame, f"ETAT: {status}", (20, 50), 2, 1, color, 2)
-        cv2.putText(frame, f"POINTS SLAM: {nb_points.value}", (20, 90), 2, 0.7, (255, 255, 255), 1)
-        cv2.circle(frame, (CENTRE_X, HAUTEUR//2), 6, (0, 0, 255), -1) # "Nez" du bot
+            if error > 100: pydirectinput.keyDown('d'); pydirectinput.keyUp('a')
+            elif error < -100: pydirectinput.keyDown('a'); pydirectinput.keyUp('d')
+            else: pydirectinput.keyUp('a'); pydirectinput.keyUp('d')
+            
+            # Interaction automatique
+            if (best_box.xyxy[0][3] - best_box.xyxy[0][1]) > (HEIGHT * 0.45):
+                BallisticInput.urgent_interact()
+            
+            self.cog.stuck_buffer.append(motion)
+            status = "PURSUIT_ACTIVE"
         
-        cv2.imshow("IA DOORS - SYSTÈME AUTONOME V5", frame)
+        # 5. Gestion de l'échec de progression
+        elif len(self.cog.stuck_buffer) == 30 and np.mean(self.cog.stuck_buffer) < 0.01:
+            status = "EMERGENCY_RECOVERY"
+            pydirectinput.keyUp('w')
+            pydirectinput.press('s', presses=2)
+            BallisticInput.move_smooth(500)
+            self.cog.stuck_buffer.clear()
+        
+        else:
+            status = "OPTIMIZED_SCAN"
+            scan = math.sin(time.time() * 3) * 20
+            BallisticInput.move_smooth(scan)
+            if int(time.time() * 2) % 4 == 0: pydirectinput.press('w')
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        return status
+
+# ==============================================================================
+# 6. INITIALISATION ET BOUCLE INFINIE
+# ==============================================================================
+agent = GodAgent()
+with mss.mss() as sct:
+    mon = {"top": 10, "left": 10, "width": WIDTH, "height": HEIGHT}
+    print("⚡ IA DOORS V14 : PROTOCOLE SUPRÊME ACTIVÉ")
+    
+    while True:
+        loop_start = time.time()
+        frame = cv2.cvtColor(np.array(sct.grab(mon)), cv2.COLOR_BGRA2BGR)
+        
+        state = agent.run_cycle(frame)
+        
+        # HUD Debug minimaliste (pour la performance)
+        cv2.putText(frame, state, (20, 40), 1, 1.5, (0, 255, 0), 2)
+        cv2.imshow("IA DOORS GOD-MODE", frame)
+
+        dt = time.time() - loop_start
+        if cv2.waitKey(max(1, int((0.016 - dt)*1000))) & 0xFF == ord('q'):
             pydirectinput.keyUp('w')
             break
-
-cv2.destroyAllWindows()
